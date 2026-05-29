@@ -4,33 +4,124 @@ import { db } from "@/lib/db";
 import { suppliers, sourceProducts, scrapedOffers } from "@/lib/db/schema";
 import { desc, eq } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
+import { scrapeProductPage } from "@/lib/scraper";
 import {
   Card,
   CardContent,
+  CardDescription,
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
+import { ScrapeButton } from "@/components/scrape-button";
+import { AddSourceForm } from "@/components/add-source-form";
+import { RescrapeAllButton } from "@/components/rescrape-all-button";
 import {
   ArrowLeft,
   ExternalLink,
-  Sparkles,
   TrendingDown,
   TrendingUp,
   BarChart3,
 } from "lucide-react";
 
-async function seedDummyOffers(formData: FormData) {
+type ScrapeState = { error?: string; success?: boolean } | null;
+type RescrapeState = { error?: string; refreshed?: number } | null;
+
+function getDomain(url: string) {
+  try {
+    return new URL(url).hostname.replace(/^www\./, "");
+  } catch {
+    return url;
+  }
+}
+
+async function scrapeOffer(
+  _prev: ScrapeState,
+  formData: FormData
+): Promise<ScrapeState> {
   "use server";
-  const id = Number(formData.get("product_id"));
-  await db.insert(scrapedOffers).values([
-    { sourceProductId: id, title: "Offer from Seller A", price: 19.99, currency: "USD", inStock: true },
-    { sourceProductId: id, title: "Offer from Seller B", price: 17.49, currency: "USD", inStock: true },
-    { sourceProductId: id, title: "Offer from Seller C", price: 22.0, currency: "USD", inStock: false },
-  ]);
-  revalidatePath(`/products/${id}`);
+  const productId = Number(formData.get("product_id"));
+  const sourceUrl = String(formData.get("source_url"));
+  try {
+    const result = await scrapeProductPage(sourceUrl);
+    await db.insert(scrapedOffers).values({
+      sourceProductId: productId,
+      sourceUrl,
+      title: result.title,
+      price: result.price,
+      currency: result.currency,
+      inStock: result.inStock,
+    });
+    revalidatePath(`/products/${productId}`);
+    revalidatePath("/dashboard");
+    return { success: true };
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : "Scrape failed" };
+  }
+}
+
+async function scrapeNewSource(
+  _prev: ScrapeState,
+  formData: FormData
+): Promise<ScrapeState> {
+  "use server";
+  const productId = Number(formData.get("product_id"));
+  const competitorUrl = String(formData.get("competitor_url")).trim();
+  if (!competitorUrl) return { error: "URL is required" };
+  try {
+    const result = await scrapeProductPage(competitorUrl);
+    await db.insert(scrapedOffers).values({
+      sourceProductId: productId,
+      sourceUrl: competitorUrl,
+      title: result.title,
+      price: result.price,
+      currency: result.currency,
+      inStock: result.inStock,
+    });
+    revalidatePath(`/products/${productId}`);
+    revalidatePath("/dashboard");
+    return { success: true };
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : "Scrape failed" };
+  }
+}
+
+async function rescrapeAll(
+  _prev: RescrapeState,
+  formData: FormData
+): Promise<RescrapeState> {
+  "use server";
+  const productId = Number(formData.get("product_id"));
+
+  // Collect all distinct sourceUrls tracked for this product
+  const existing = await db
+    .select({ sourceUrl: scrapedOffers.sourceUrl })
+    .from(scrapedOffers)
+    .where(eq(scrapedOffers.sourceProductId, productId));
+
+  const urls = [...new Set(existing.map((o) => o.sourceUrl).filter(Boolean))] as string[];
+  if (urls.length === 0) return { error: "No source URLs to rescrape" };
+
+  const results = await Promise.allSettled(
+    urls.map(async (url) => {
+      const result = await scrapeProductPage(url);
+      await db.insert(scrapedOffers).values({
+        sourceProductId: productId,
+        sourceUrl: url,
+        title: result.title,
+        price: result.price,
+        currency: result.currency,
+        inStock: result.inStock,
+      });
+    })
+  );
+
+  revalidatePath(`/products/${productId}`);
   revalidatePath("/dashboard");
+
+  const succeeded = results.filter((r) => r.status === "fulfilled").length;
+  if (succeeded === 0) return { error: "All sources failed to scrape" };
+  return { refreshed: succeeded };
 }
 
 export default async function ProductDetailPage({
@@ -76,11 +167,16 @@ export default async function ProductDetailPage({
         }
       : null;
 
+  const trackedSourceUrls = [
+    ...new Set(offers.map((o) => o.sourceUrl).filter(Boolean)),
+  ] as string[];
+
   const fmt = (n: number, currency: string) =>
     new Intl.NumberFormat("en-US", { style: "currency", currency }).format(n);
 
   return (
     <div className="flex flex-col gap-8">
+      {/* Header */}
       <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
         <div className="flex flex-col gap-2">
           <Link
@@ -105,15 +201,23 @@ export default async function ProductDetailPage({
             </a>
           </div>
         </div>
-        <form action={seedDummyOffers}>
-          <input type="hidden" name="product_id" value={productId} />
-          <Button type="submit" variant="outline" size="sm">
-            <Sparkles size={14} className="mr-1.5" />
-            Seed dummy offers
-          </Button>
-        </form>
+        <div className="flex items-start gap-2">
+          {trackedSourceUrls.length > 0 && (
+            <RescrapeAllButton
+              action={rescrapeAll}
+              productId={productId}
+              sourceCount={trackedSourceUrls.length}
+            />
+          )}
+          <ScrapeButton
+            action={scrapeOffer}
+            productId={productId}
+            sourceUrl={product.sourceUrl}
+          />
+        </div>
       </div>
 
+      {/* Price stats */}
       {priceStats && (
         <div className="grid gap-4 sm:grid-cols-3">
           <Card>
@@ -158,16 +262,38 @@ export default async function ProductDetailPage({
         </div>
       )}
 
+      {/* Add competitor source */}
+      <Card>
+        <CardHeader>
+          <CardTitle>Add a competitor source</CardTitle>
+          <CardDescription>
+            Paste a product URL from any other supplier to scrape their price
+            and compare against your current source.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <AddSourceForm action={scrapeNewSource} productId={productId} />
+        </CardContent>
+      </Card>
+
+      {/* Offers list */}
       <Card>
         <CardHeader>
           <CardTitle>Offers</CardTitle>
+          {trackedSourceUrls.length > 0 && (
+            <CardDescription>
+              Tracking {trackedSourceUrls.length} source
+              {trackedSourceUrls.length !== 1 ? "s" : ""}:{" "}
+              {trackedSourceUrls.map((u) => getDomain(u)).join(", ")}
+            </CardDescription>
+          )}
         </CardHeader>
         <CardContent>
           {offers.length === 0 ? (
             <p className="text-sm text-foreground/60">
               No offers yet. Click{" "}
-              <span className="font-medium">Seed dummy offers</span> above to
-              add some sample data.
+              <span className="font-medium">Scrape now</span> to pull the live
+              price from the source URL, or add a competitor URL above.
             </p>
           ) : (
             <ul className="divide-y">
@@ -176,22 +302,37 @@ export default async function ProductDetailPage({
                   key={offer.id}
                   className="flex items-center justify-between gap-4 py-3"
                 >
-                  <div>
-                    <p className="text-sm font-medium">
+                  <div className="min-w-0">
+                    <p className="text-sm font-medium truncate">
                       {offer.title ?? "Untitled offer"}
                     </p>
-                    <p className="text-xs text-foreground/40">
-                      {offer.createdAt
-                        ? new Date(offer.createdAt).toLocaleDateString()
-                        : ""}
-                    </p>
+                    <div className="flex items-center gap-2 mt-0.5">
+                      {offer.sourceUrl && (
+                        <a
+                          href={offer.sourceUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="flex items-center gap-0.5 text-xs text-foreground/40 hover:text-foreground"
+                        >
+                          {getDomain(offer.sourceUrl)}
+                          <ExternalLink size={10} />
+                        </a>
+                      )}
+                      <span className="text-xs text-foreground/30">
+                        {offer.createdAt
+                          ? new Date(offer.createdAt).toLocaleDateString()
+                          : ""}
+                      </span>
+                    </div>
                   </div>
                   <div className="flex shrink-0 items-center gap-2">
-                    {priceStats && offer.inStock && offer.price === priceStats.min && (
-                      <Badge className="bg-green-500 text-white hover:bg-green-600">
-                        Best price
-                      </Badge>
-                    )}
+                    {priceStats &&
+                      offer.inStock &&
+                      offer.price === priceStats.min && (
+                        <Badge className="bg-green-500 text-white hover:bg-green-600">
+                          Best price
+                        </Badge>
+                      )}
                     <Badge variant={offer.inStock ? "default" : "secondary"}>
                       {offer.inStock ? "In stock" : "Out of stock"}
                     </Badge>
