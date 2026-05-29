@@ -43,6 +43,7 @@ export const scrapedOffers = sqliteTable(
     sourceProductId: integer("source_product_id")
       .notNull()
       .references(() => sourceProducts.id, { onDelete: "cascade" }),
+    sourceUrl: text("source_url"),
     title: text("title"),
     price: real("price").notNull(),
     currency: text("currency").notNull().default("USD"),
